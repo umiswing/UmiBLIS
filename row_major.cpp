@@ -3,6 +3,7 @@
 #include "../NiuTensor/source/tensor/function/FHeader.h"
 #include <cstdlib>
 #include <cstdio>
+#include <immintrin.h>
 using namespace std;
 using namespace nts;
 
@@ -13,15 +14,15 @@ using namespace nts;
 //#define DGEMM_KC 128
 //#define DGEMM_MR 8
 //#define DGEMM_NR 6
-#define DGEMM_MR 4
-#define DGEMM_NR 4
+#define DGEMM_MR 8
+#define DGEMM_NR 8
 
 #define Min( i, j ) ( (i)<(j) ? (i): (j) )
 
-#define A( i, j )     A[ (j)*lda + (i) ]
-#define B( i, j )     B[ (j)*ldb + (i) ]
-#define C( i, j )     C[ (j)*ldc + (i) ]
-#define C_ref( i, j ) C_ref[ (j)*ldc_ref + (i) ]
+//#define A( i, j )     A[ (j)*lda + (i) ]
+//#define B( i, j )     B[ (j)*ldb + (i) ]
+//#define C( i, j )     C[ (j)*ldc + (i) ]
+//#define C_ref( i, j ) C_ref[ (j)*ldc_ref + (i) ]
 //#define A( i, j )     A[ (i)*lda + (j) ]
 //#define B( i, j )     B[ (i)*ldb + (j) ]
 //#define C( i, j )     C[ (i)*ldc + (j) ]
@@ -36,13 +37,52 @@ struct aux_s {
     int    n;
 };
 typedef struct aux_s aux_t;
+////micro-panel a is stored in column major, lda=DGEMM_MR.
+//#define a(i,j) a[ (j)*DGEMM_MR + (i) ]
+////micro-panel b is stored in row major, ldb=DGEMM_NR.
+//#define b(i,j) b[ (i)*DGEMM_NR + (j) ]
+////result      c is stored in column major.
+//#define c(i,j) c[ (j)*ldc + (i) ]
+
 //micro-panel a is stored in column major, lda=DGEMM_MR.
 #define a(i,j) a[ (j)*DGEMM_MR + (i) ]
 //micro-panel b is stored in row major, ldb=DGEMM_NR.
 #define b(i,j) b[ (i)*DGEMM_NR + (j) ]
 //result      c is stored in column major.
-#define c(i,j) c[ (j)*ldc + (i) ]
+#define c(i,j) c[ (i)*ldc + (j) ]
 
+void bl_dgemm_int_8x8(
+                        int    k,
+                        float *a,
+                        float *b,
+                        float *c,
+                        unsigned long long ldc,
+                        aux_t* data
+                      )
+{
+    int l, j, i;
+
+    for ( l = 0; l < k; ++l )
+    {                 
+        __m256 rc;
+        //__m256 rb = _mm256_broadcast_ss(b+l*DGEMM_NR);
+        __m256 rb = _mm256_loadu_ps(b+l*DGEMM_NR);
+        for(i=0;i<DGEMM_MR;i++)
+        {
+            __m256 ra = _mm256_broadcast_ss(a+l*DGEMM_MR+i);
+            __m256 aux;
+            //aux = _mm256_loadu_ps(c+i*DGEMM_NR);
+            aux = _mm256_loadu_ps(c+i*ldc);
+            //if(i==0)
+                //aux = _mm256_loadu_ps(c+i*DGEMM_NR);
+            //else
+                //aux = _mm256_loadu_ps(c+(i-1)*DGEMM_NR);
+            rc = _mm256_fmadd_ps(ra,rb,aux);
+            //_mm256_storeu_ps(c+i*DGEMM_NR,rc);
+            _mm256_storeu_ps(c+i*ldc,rc);
+        }
+    }
+}
 
 void bl_dgemm_ukr( int    k,
                    float *a,
@@ -66,7 +106,8 @@ void bl_dgemm_ukr( int    k,
 
 }
 
-#define BL_MICRO_KERNEL bl_dgemm_ukr
+//#define BL_MICRO_KERNEL bl_dgemm_ukr
+#define BL_MICRO_KERNEL bl_dgemm_int_8x8
 
 static void (*bl_micro_kernel) (
         int    k,
@@ -142,6 +183,12 @@ inline void packA_mcxkc_d(
 
     for ( p = 0; p < k; p ++ ) {
         for ( i = 0; i < DGEMM_MR; i ++ ) {
+            if(i>=m)
+            {
+                *packA=0;
+                packA++;
+                continue;
+            }
             *packA = *a_pntr[ i ];
             packA ++;
             //a_pntr[ i ] = a_pntr[ i ] + ldXA;
@@ -227,6 +274,11 @@ inline void packB_kcxnc_d(
 
     for ( p = 0; p < k; p ++ ) {
         for ( i = 0; i < DGEMM_NR; i ++ ) {
+            if(i>=n)
+            {
+                *packB ++ = 0;
+                continue;
+            }
             *packB ++ = *b_pntr[ p ] ++;
         }
     }
@@ -270,7 +322,7 @@ void bl_macro_kernel(
                     k,
                     &packA[ i * k ],
                     &packB[ j * k ],
-                    &C[ j * ldc + i ],
+                    &C[ i * ldc + j ],
                     (unsigned long long) ldc,
                     &aux
                     );
@@ -288,8 +340,8 @@ void bl_dgemm(
         float *XB,
         int    ldb,
         float *C,        // must be aligned
-        int    ldc,        // ldc must also be aligned
-        float *XA_TRANS
+        int    ldc        // ldc must also be aligned
+        //float *XA_TRANS
         )
 {
     int    i, j, p, bl_ic_nt;
@@ -359,6 +411,7 @@ void bl_dgemm(
 
 
             // so for A, the pack order is: K->M
+            //for ( ic = 0; ic < m; ic += DGEMM_MC ) {                               // 3-rd loop around micro-kernel
             for ( ic = 0; ic < m; ic += DGEMM_MC ) {                               // 3-rd loop around micro-kernel
             // so for each ic, we execute a kernel computation.
 
@@ -391,7 +444,7 @@ void bl_dgemm(
                         packA  + 0 * DGEMM_MC * pb,
                         //packA_ref  + 0 * DGEMM_MC * pb,
                         packB,
-                        &C[ jc * ldc + ic ], 
+                        &C[ ic * ldc + jc ], 
                         ldc
                         );
             }                                                                     // End 3.rd loop around micro-kernel
@@ -418,6 +471,7 @@ void calDiff(XTensor a,XTensor b,XTensor scale)
     {
 	    for(int j=0;j<a.dimSize[1];++j)
 	    {
+            //printf("\n%d,%d\n",i,j);
             float av = a.Get2D(i,j);
             float bv = b.Get2D(i,j);
             fprintf(f1,"%.3f\n",av);
@@ -438,9 +492,9 @@ int main()
 {
 	XTensor a,b,c_ref,c,a_trans;
     int m,k,n;
-    m=512;
-    k=512;
-    n=512;
+    m=509;
+    k=513;
+    n=513;
     InitTensor2D(&a,m,k,nts::X_FLOAT);
     InitTensor2D(&a_trans,m,k,nts::X_FLOAT);
 	InitTensor2D(&b, k, n, nts::X_FLOAT);
@@ -448,8 +502,9 @@ int main()
     InitTensor2D(&c,m,n,X_FLOAT);
     a.SetDataRand(-1,1);
     b.SetDataRand(-1,1);
+    c.SetZeroAll();
     c_ref=MatrixMul(a,b);
-    a_trans=Transpose(a,0,1);
+    //a_trans=Transpose(a,0,1);
     //b=Transpose(b,0,1);
     bl_dgemm(
             m,
@@ -460,10 +515,13 @@ int main()
             (float*)b.data,
             n,
             (float*)c.data,
-            m,
-            (float*)a_trans.data
+            n
+            //(float*)a_trans.data
             );
-    c=Transpose(c,0,1);
+    //printf("\n%d,%d\n",c.dimSize[0],c.dimSize[1]);
+    //c=Transpose(c,0,1);
+    //printf("\n%d,%d\n",c.dimSize[0],c.dimSize[1]);
+    //exit(1);
     XTensor s;
     InitTensor2D(&s,m,n,X_FLOAT);
     s.SetDataFixed(1);
